@@ -1,4 +1,4 @@
-name: Port LOS 15 non-KernelSU commits
+name: Import Albus 4.9 DroidSpaces series
 
 on:
   push:
@@ -12,61 +12,230 @@ permissions:
   contents: write
 
 jobs:
-  port:
+  import:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
 
     steps:
-      - name: Checkout LOS 15 base
+      - name: Checkout helper branch
         uses: actions/checkout@v4
         with:
-          ref: lineage-15.1
+          ref: ci-port-helper
           fetch-depth: 1
 
-      - name: Port validated non-KernelSU commits
+      - name: Import Linux 4.9 and apply DroidSpaces series
+        env:
+          SOURCE_REPO: https://github.com/SaaSD3v/kernel_motorola_msm8593_4.9.git
+          SOURCE_BRANCH: lineage-19.1
+          SOURCE_SHA: d3cf623e27988c14f7fcab4fd5c3324ac467f505
+          DROIDSPACES_REF: ravindu644/Droidspaces-OSS@2280b592f43312254dc3c976fc01558aa1186d51
         run: |
           set -euxo pipefail
 
           git config user.name 'SaaSD3v'
           git config user.email 'hearesaas@gmail.com'
 
-          test "$(git rev-parse HEAD)" = "e043ce3fb128f61698ab53311d20705685ac9b06"
+          git remote add k49 "$SOURCE_REPO"
+          git fetch --depth=1 --no-tags k49 "$SOURCE_BRANCH"
+          test "$(git rev-parse k49/$SOURCE_BRANCH)" = "$SOURCE_SHA"
 
-          git remote add los15-reference https://github.com/SaaSD3v/android_kernel_motorola_msm8996.git
-          git fetch --depth=20 --no-tags los15-reference lineage-15.1
+          # Create a clean root import rather than mixing the former 3.18 history
+          # with the unrelated 4.9 lineage. The imported tree is byte-for-byte
+          # the selected Albus 4.9 source snapshot before DroidSpaces changes.
+          git checkout --orphan albus-4.9-droidspaces "k49/$SOURCE_BRANCH"
+          git read-tree --reset -u "k49/$SOURCE_BRANCH"
+          git commit -m 'albus: import Linux 4.9.227 baseline' \
+            -m 'Import the exact Albus Linux 4.9.227 tree from SaaSD3v/kernel_motorola_msm8593_4.9 lineage-19.1.' \
+            -m "Source-Commit: $SOURCE_SHA"
 
-          git checkout -B lineage-15.1-albus-ci e043ce3fb128f61698ab53311d20705685ac9b06
-
-          commits=(
-            064c1c410c6f174e6f4c1d4462502cbca5b8d57d
-            df88924352e30ea00bf25b59ffc1624fca657e1e
-            dff95d9238ed8eec00b14ce9a4067ab996a58704
-            14f9a7bf3342234fec55be38d0d57e8298013721
-            43e5c1e815dd060a4d9807cab8bc543dc404750b
-            95d58641559a1ce92d7468fd67a10d445b102bda
-            7fd0914d8964b28ac4f2ded0c084c2b7615a8599
-            516086ce0637a9e820793695a4dd8e3ff43e055b
-            155561f0a3c1035128563a38670fed14fb26ee8c
-            9a7416218ae637c4120c417b31428bb0747fdfdf
-          )
-
-          for c in "${commits[@]}"; do
-            git cherry-pick -x "$c"
-          done
-
+          test "$(git rev-parse HEAD^{tree})" = "$(git rev-parse k49/$SOURCE_BRANCH^{tree})"
+          grep -qx 'VERSION = 4' Makefile
+          grep -qx 'PATCHLEVEL = 9' Makefile
+          grep -qx 'SUBLEVEL = 227' Makefile
+          grep -q 'static struct file_system_type cgroup2_fs_type;' kernel/cgroup.c
+          grep -q 'struct cgroup_namespace init_cgroup_ns' kernel/cgroup.c
           test ! -d drivers/kernelsu
-          ! grep -q '^CONFIG_KSU=' arch/arm64/configs/albus_defconfig
-          ! grep -q '^CONFIG_KSU_' arch/arm64/configs/albus_defconfig
 
-          grep -qx 'CONFIG_ANDROID_PARANOID_NETWORK=n' arch/arm64/configs/albus_defconfig
-          grep -qx 'CONFIG_DEVPTS_MULTIPLE_INSTANCES=y' arch/arm64/configs/albus_defconfig
-          grep -qx 'CONFIG_OVERLAY_FS=y' arch/arm64/configs/albus_defconfig
-          grep -qx 'CONFIG_VETH=y' arch/arm64/configs/albus_defconfig
-          grep -q 'runtimes such as DroidSpaces and LXC' kernel/cgroup.c
-          grep -q 'stats = &no_dev_stats;' net/netfilter/xt_qtaguid.c
-          grep -q '^extern YYLTYPE yylloc;' scripts/dtc/dtc-lexer.l
-          grep -q '^extern YYLTYPE yylloc;' scripts/dtc/dtc-lexer.lex.c_shipped
-          grep -q '^#include <linux/android_aid.h>$' security/commoncap.c
+          DEFCONFIG=arch/arm64/configs/albus_defconfig
+          test -f "$DEFCONFIG"
+          test -x scripts/config
 
-          git --no-pager log --oneline -11
-          git push --force origin HEAD:lineage-15.1-albus-ci
+          # Index the actual Kconfig symbols in this 4.9 tree so newer-only
+          # options are never blindly appended to the defconfig.
+          grep -RhE '^[[:space:]]*(menu)?config[[:space:]]+[A-Za-z0-9_]+' \
+            --include='Kconfig*' . \
+            | sed -E 's/^[[:space:]]*(menu)?config[[:space:]]+([A-Za-z0-9_]+).*/\2/' \
+            | sort -u > /tmp/kconfig-symbols
+
+          enable_if_supported() {
+            local sym="$1"
+            if grep -qx "$sym" /tmp/kconfig-symbols; then
+              scripts/config --file "$DEFCONFIG" -e "$sym"
+            else
+              echo "SKIP unsupported CONFIG_$sym"
+            fi
+          }
+
+          disable_if_supported() {
+            local sym="$1"
+            if grep -qx "$sym" /tmp/kconfig-symbols; then
+              scripts/config --file "$DEFCONFIG" -d "$sym"
+            else
+              echo "SKIP unsupported CONFIG_$sym"
+            fi
+          }
+
+          commit_defconfig() {
+            local subject="$1"
+            git add "$DEFCONFIG"
+            if git diff --cached --quiet; then
+              echo "No defconfig delta for: $subject"
+            else
+              git commit -m "$subject" \
+                -m 'Adapted specifically for the Albus Linux 4.9 tree; only Kconfig symbols implemented by this kernel are enabled.' \
+                -m "DroidSpaces-Reference: $DROIDSPACES_REF"
+            fi
+          }
+
+          # 1/5: Required process/container primitives.
+          for sym in \
+            SYSCTL SYSVIPC POSIX_MQUEUE \
+            NAMESPACES PID_NS UTS_NS IPC_NS USER_NS \
+            SECCOMP SECCOMP_FILTER; do
+            enable_if_supported "$sym"
+          done
+          commit_defconfig 'droidspaces: enable IPC namespaces and seccomp'
+
+          # 2/5: cgroup controllers usable by the 4.9 legacy/default hierarchies.
+          # cgroup2 itself is implemented by the 4.9 core when CONFIG_CGROUPS=y;
+          # there is deliberately no invented CONFIG_CGROUP2 switch.
+          for sym in \
+            CGROUPS CGROUP_DEVICE CGROUP_PIDS CGROUP_SCHED FAIR_GROUP_SCHED \
+            CFS_BANDWIDTH CGROUP_FREEZER CGROUP_CPUACCT CGROUP_NET_PRIO \
+            CPUSETS PROC_PID_CPUSET \
+            MEMCG MEMCG_SWAP MEMCG_KMEM \
+            CGROUP_MEM_RES_CTLR CGROUP_MEM_RES_CTLR_SWAP CGROUP_MEM_RES_CTLR_KMEM \
+            BLK_CGROUP CGROUP_WRITEBACK CGROUP_HUGETLB CGROUP_PERF; do
+            enable_if_supported "$sym"
+          done
+          commit_defconfig 'droidspaces: enable 4.9 cgroup v1/v2 resource controllers'
+
+          # 3/5: /dev, storage and container filesystem primitives.
+          for sym in \
+            DEVTMPFS OVERLAY_FS TMPFS_POSIX_ACL TMPFS_XATTR \
+            FW_LOADER FW_LOADER_USER_HELPER FW_LOADER_COMPRESS \
+            TUN BLK_DEV_LOOP; do
+            enable_if_supported "$sym"
+          done
+          commit_defconfig 'droidspaces: enable container device and filesystem primitives'
+
+          # 4/5: Network namespaces and NAT. Keep legacy iptables alongside
+          # nftables where the 4.9 tree actually implements it.
+          for sym in \
+            NET_NS VETH BRIDGE NETFILTER BRIDGE_NETFILTER NETFILTER_ADVANCED \
+            NF_CONNTRACK IP_NF_IPTABLES IP_NF_FILTER NF_NAT NF_TABLES \
+            IP_NF_TARGET_MASQUERADE NETFILTER_XT_TARGET_MASQUERADE \
+            NETFILTER_XT_TARGET_TCPMSS NETFILTER_XT_MATCH_ADDRTYPE \
+            NF_CONNTRACK_NETLINK NF_NAT_REDIRECT \
+            IP_ADVANCED_ROUTER IP_MULTIPLE_TABLES \
+            NF_CONNTRACK_IPV4 NF_NAT_IPV4 IP_NF_NAT; do
+            enable_if_supported "$sym"
+          done
+          commit_defconfig 'droidspaces: enable namespace networking and NAT support'
+
+          # 5/5: Optional UFW / Fail2ban support from the non-GKI guide.
+          for sym in \
+            NETFILTER_XT_MATCH_COMMENT NETFILTER_XT_MATCH_STATE \
+            NETFILTER_XT_MATCH_CONNTRACK NETFILTER_XT_MATCH_MULTIPORT \
+            NETFILTER_XT_MATCH_HL NETFILTER_XT_TARGET_REJECT \
+            IP_NF_TARGET_REJECT NETFILTER_XT_TARGET_LOG IP_NF_TARGET_ULOG \
+            NETFILTER_XT_MATCH_RECENT NETFILTER_XT_MATCH_LIMIT \
+            NETFILTER_XT_MATCH_HASHLIMIT NETFILTER_XT_MATCH_OWNER \
+            NETFILTER_XT_MATCH_PKTTYPE NETFILTER_XT_MATCH_MARK \
+            NETFILTER_XT_TARGET_MARK IP_SET IP_SET_HASH_IP IP_SET_HASH_NET \
+            NETFILTER_XT_SET NETFILTER_NETLINK_QUEUE NETFILTER_NETLINK_LOG \
+            NETFILTER_XT_TARGET_NFLOG; do
+            enable_if_supported "$sym"
+          done
+          commit_defconfig 'droidspaces: enable optional UFW and Fail2ban firewall support'
+
+          # Android paranoid networking is only disabled if this exact 4.9
+          # tree still carries the legacy symbol. This Albus tree currently
+          # does not, so no fake config entry is created.
+          disable_if_supported ANDROID_PARANOID_NETWORK
+          git add "$DEFCONFIG"
+          if ! git diff --cached --quiet; then
+            git commit -m 'droidspaces: disable legacy Android paranoid networking' \
+              -m "DroidSpaces-Reference: $DROIDSPACES_REF"
+          fi
+
+          # Adapt DroidSpaces official non-GKI patch 02 to Linux 4.9's
+          # pre-split cgroup layout (kernel/cgroup.c instead of
+          # kernel/cgroup/cgroup.c). It restores prefixed aliases when a v1
+          # hierarchy is mounted with noprefix, while leaving cgroup2 intact.
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('kernel/cgroup.c')
+          s = p.read_text()
+          if 'DroidSpaces/LXC compatibility: keep prefixed aliases' not in s:
+              old = '''\tif (cft->file_offset) {
+          \t\tstruct cgroup_file *cfile = (void *)css + cft->file_offset;
+          
+          \t\tspin_lock_irq(&cgroup_file_kn_lock);
+          \t\tcfile->kn = kn;
+          \t\tspin_unlock_irq(&cgroup_file_kn_lock);
+          \t}
+          
+          \treturn 0;
+          }
+          '''
+              new = '''\tif (cft->file_offset) {
+          \t\tstruct cgroup_file *cfile = (void *)css + cft->file_offset;
+          
+          \t\tspin_lock_irq(&cgroup_file_kn_lock);
+          \t\tcfile->kn = kn;
+          \t\tspin_unlock_irq(&cgroup_file_kn_lock);
+          \t}
+          
+          \t/* DroidSpaces/LXC compatibility: keep prefixed aliases for noprefix. */
+          \tif (cft->ss && (cgrp->root->flags & CGRP_ROOT_NOPREFIX) &&
+          \t    !(cft->flags & CFTYPE_NO_PREFIX)) {
+          \t\tsnprintf(name, CGROUP_FILE_NAME_MAX, "%s.%s",
+          \t\t\t cft->ss->name, cft->name);
+          \t\tkernfs_create_link(cgrp->kn, name, kn);
+          \t}
+          
+          \treturn 0;
+          }
+          '''
+              if old not in s:
+                  raise SystemExit('cgroup_add_file layout did not match expected Albus 4.9 source')
+              p.write_text(s.replace(old, new, 1))
+          PY
+
+          git add kernel/cgroup.c
+          if ! git diff --cached --quiet; then
+            git commit --author='ravindu644 <droidcasts@protonmail.com>' \
+              -m 'Droidspaces/LXC: fix: restore cgroup file prefix handling' \
+              -m 'Adapt official non-GKI patch 02 to the Linux 4.9 pre-split cgroup source layout.' \
+              -m 'Original-Patch: ravindu644/Droidspaces-OSS@50cb2ccbef7d84852f2600bb4d3e69f6bd736561' \
+              -m 'Signed-off-by: ravindu644 <droidcasts@protonmail.com>'
+          fi
+
+          # The official qtaguid patch is intentionally not applied: this 4.9
+          # source does not contain xt_qtaguid. Likewise, do not import KSU.
+          test ! -e net/netfilter/xt_qtaguid.c
+          test ! -d drivers/kernelsu
+          ! grep -Rqs '^CONFIG_KSU' "$DEFCONFIG"
+
+          # Source-level validation of the 4.9 cgroup2/cgroup namespace core.
+          grep -q 'static struct file_system_type cgroup2_fs_type;' kernel/cgroup.c
+          grep -q 'struct cgroup_namespace init_cgroup_ns' kernel/cgroup.c
+          grep -q 'DroidSpaces/LXC compatibility: keep prefixed aliases' kernel/cgroup.c
+
+          echo '===== Final DroidSpaces series ====='
+          git --no-pager log --oneline --decorate -12
+          echo '===== Defconfig DroidSpaces-relevant settings ====='
+          grep -E '^(CONFIG_(SYSVIPC|POSIX_MQUEUE|NAMESPACES|PID_NS|UTS_NS|IPC_NS|USER_NS|SECCOMP|SECCOMP_FILTER|CGROUPS|CGROUP_DEVICE|CGROUP_PIDS|MEMCG|CGROUP_MEM_RES_CTLR|DEVTMPFS|OVERLAY_FS|NET_NS|VETH|BRIDGE|NETFILTER|NF_NAT|IP_SET)=|# CONFIG_ANDROID_PARANOID_NETWORK)' "$DEFCONFIG" || true
+
+          git push --force origin HEAD:lineage-15.1
