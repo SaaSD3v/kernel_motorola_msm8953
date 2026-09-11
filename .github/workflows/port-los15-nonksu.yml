@@ -1,0 +1,72 @@
+name: Port LOS 15 non-KernelSU commits
+
+on:
+  push:
+    branches:
+      - ci-port-helper
+    paths:
+      - '.github/workflows/port-los15-nonksu.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  port:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout LOS 15 base
+        uses: actions/checkout@v4
+        with:
+          ref: lineage-15.1
+          fetch-depth: 1
+
+      - name: Port validated non-KernelSU commits
+        run: |
+          set -euxo pipefail
+
+          git config user.name 'SaaSD3v'
+          git config user.email 'hearesaas@gmail.com'
+
+          test "$(git rev-parse HEAD)" = "e043ce3fb128f61698ab53311d20705685ac9b06"
+
+          git remote add los15-reference https://github.com/SaaSD3v/android_kernel_motorola_msm8996.git
+          git fetch --depth=20 --no-tags los15-reference lineage-15.1
+
+          git checkout -B lineage-15.1-albus-ci e043ce3fb128f61698ab53311d20705685ac9b06
+
+          commits=(
+            064c1c410c6f174e6f4c1d4462502cbca5b8d57d
+            df88924352e30ea00bf25b59ffc1624fca657e1e
+            dff95d9238ed8eec00b14ce9a4067ab996a58704
+            14f9a7bf3342234fec55be38d0d57e8298013721
+            43e5c1e815dd060a4d9807cab8bc543dc404750b
+            95d58641559a1ce92d7468fd67a10d445b102bda
+            7fd0914d8964b28ac4f2ded0c084c2b7615a8599
+            516086ce0637a9e820793695a4dd8e3ff43e055b
+            155561f0a3c1035128563a38670fed14fb26ee8c
+            9a7416218ae637c4120c417b31428bb0747fdfdf
+          )
+
+          for c in "${commits[@]}"; do
+            git cherry-pick -x "$c"
+          done
+
+          test ! -d drivers/kernelsu
+          ! grep -q '^CONFIG_KSU=' arch/arm64/configs/albus_defconfig
+          ! grep -q '^CONFIG_KSU_' arch/arm64/configs/albus_defconfig
+
+          grep -qx 'CONFIG_ANDROID_PARANOID_NETWORK=n' arch/arm64/configs/albus_defconfig
+          grep -qx 'CONFIG_DEVPTS_MULTIPLE_INSTANCES=y' arch/arm64/configs/albus_defconfig
+          grep -qx 'CONFIG_OVERLAY_FS=y' arch/arm64/configs/albus_defconfig
+          grep -qx 'CONFIG_VETH=y' arch/arm64/configs/albus_defconfig
+          grep -q 'runtimes such as DroidSpaces and LXC' kernel/cgroup.c
+          grep -q 'stats = &no_dev_stats;' net/netfilter/xt_qtaguid.c
+          grep -q '^extern YYLTYPE yylloc;' scripts/dtc/dtc-lexer.l
+          grep -q '^extern YYLTYPE yylloc;' scripts/dtc/dtc-lexer.lex.c_shipped
+          grep -q '^#include <linux/android_aid.h>$' security/commoncap.c
+
+          git --no-pager log --oneline -11
+          git push --force origin HEAD:lineage-15.1-albus-ci
